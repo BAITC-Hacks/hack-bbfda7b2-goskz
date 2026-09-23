@@ -14,14 +14,16 @@
 """
 
 import argparse
+import importlib.util
 import json
-from pathlib import Path
 import os
+from pathlib import Path
+import subprocess
+import sys
 import numpy as np
 import pandas as pd
 import networkx as nx
-from dotenv import load_dotenv 
-from openai import OpenAI
+from dotenv import load_dotenv
 
 ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "peripheral"]
 
@@ -368,6 +370,7 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     write_clusters(roles, G, out_dir)
     write_top_nodes(roles, out_dir)
     write_network_html(roles, G, out_dir)
+    return roles
 
 def summarize_run(G: nx.DiGraph, df: pd.DataFrame):
     """Print role totals and the main limits of the observed graph."""
@@ -384,11 +387,11 @@ def summarize_run(G: nx.DiGraph, df: pd.DataFrame):
     print("  Роли — гипотезы по наблюдаемым потокам, а не утверждения о нарушениях.")
 
 
-def main():
+def analyze_main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=None, help="папка с parquet-файлами (по умолчанию рядом со скриптом: parquet)")
     ap.add_argument("--out", default=None, help="куда писать выгрузки (по умолчанию рядом со скриптом: out)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     project_dir = Path(__file__).resolve().parent
     data_dir = Path(a.data) if a.data else project_dir / "parquet"
@@ -399,6 +402,60 @@ def main():
     df = basic_features(G, nodes)
     write_outputs(df, out_dir, G)
     summarize_run(G, df)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def validate_startup(root: Path = PROJECT_ROOT) -> None:
+    """Check the unified UI, transaction inputs, and its runtime dependencies."""
+    app_path, data_dir = root / "app.py", root / "parquet"
+    required_data = ("edges.parquet", "nodes.parquet", "transactions.parquet")
+    missing = [str(data_dir / name) for name in required_data if not (data_dir / name).is_file()]
+    if not app_path.is_file():
+        raise RuntimeError(f"Streamlit app is missing: {app_path}")
+    if missing:
+        raise RuntimeError("Missing input data: " + ", ".join(missing))
+    dependencies = ("streamlit", "pandas", "pyarrow", "networkx", "plotly")
+    absent = [name for name in dependencies if importlib.util.find_spec(name) is None]
+    if absent:
+        raise RuntimeError("Missing packages " + ", ".join(absent) + ". Run pip install -r requirements.txt")
+
+
+def launch_streamlit(root: Path = PROJECT_ROOT) -> None:
+    """Run the unified Streamlit app using the current Python environment."""
+    subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", str(root / "app.py")],
+        cwd=str(root),
+        check=True,
+    )
+
+
+def main():
+    """Validate the project and start its unified Streamlit application."""
+    parser = argparse.ArgumentParser(description="AML network analysis launcher")
+    parser.add_argument("--check", action="store_true", help="check the app environment and exit")
+    parser.add_argument("--analyze-only", action="store_true", help="regenerate graph exports and exit")
+    args = parser.parse_args()
+
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+    print("AML Network Analysis")
+    print("Checking environment...")
+    try:
+        validate_startup()
+    except RuntimeError as exc:
+        raise SystemExit(f"Startup failed: {exc}") from exc
+    print("Application configuration OK.")
+    if args.check:
+        return
+    if args.analyze_only:
+        analyze_main([])
+        return
+    print("Launching Streamlit...")
+    try:
+        launch_streamlit()
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(exc.returncode) from exc
 
 
 if __name__ == "__main__":

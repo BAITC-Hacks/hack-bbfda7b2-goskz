@@ -11,6 +11,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from agent_tools import GraphToolService
+from aml_agent import AMLAnalystAgent
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "parquet"
 OUT_DIR = ROOT / "out"
@@ -22,11 +25,27 @@ ROLE_COLORS = {
 PALETTE = ["#4d98b5", "#8b79cb", "#409c80", "#c96d62", "#c49c47", "#bb6c9d", "#3da6a0", "#7289ca"]
 
 
+@st.cache_resource(show_spinner="Preparing transaction graph...")
+def get_graph_service() -> GraphToolService:
+    """Share one graph/tool service between the network workspace and assistant."""
+    return GraphToolService.from_project_data(DATA_DIR, OUT_DIR)
+
+
+@st.cache_resource
+def get_analyst_agent() -> AMLAnalystAgent:
+    return AMLAnalystAgent.from_environment(get_graph_service())
+
+
 @st.cache_data(show_spinner="Loading supplied network data…")
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    nodes = pd.read_parquet(DATA_DIR / "nodes.parquet")
-    edges = pd.read_parquet(DATA_DIR / "edges.parquet")
-    annotations = pd.read_csv(OUT_DIR / "nodes_roles.csv")
+    service = get_graph_service()
+    annotations = service.node_data.copy()
+    nodes = annotations[["gid", "depth", "is_seed"]].copy()
+    edges = pd.DataFrame(
+        ((src, dst, data.get("sum_kzt", 0.0), data.get("n_tx", 0))
+         for src, dst, data in service.graph.edges(data=True)),
+        columns=["src", "dst", "sum_kzt", "n_tx"],
+    )
     top = pd.read_csv(OUT_DIR / "top_nodes.csv")
     nodes["gid"] = nodes["gid"].astype(str)
     edges["src"] = edges["src"].astype(str)
@@ -75,6 +94,7 @@ def reset_full_network() -> None:
 
 def select_gid(gid: str) -> None:
     st.session_state["selected_gid"] = str(gid)
+    st.session_state["agent_highlight_nodes"] = []
 
 
 def sync_inspector_selection() -> None:
@@ -82,7 +102,15 @@ def sync_inspector_selection() -> None:
 
 
 def build_network(nodes: pd.DataFrame, edges: pd.DataFrame, color_by: str, show_labels: bool,
-                  focus_gid: str, neighborhood_only: bool) -> go.Figure:
+                  focus_gid: str, neighborhood_only: bool,
+                  highlighted_gids: set[str] | None = None,
+                  highlighted_edges: list[dict] | None = None) -> go.Figure:
+    highlighted_gids = highlighted_gids or set()
+    highlighted_edge_pairs = {
+        (str(edge.get("source")), str(edge.get("target")))
+        for edge in (highlighted_edges or [])
+        if isinstance(edge, dict) and edge.get("source") is not None and edge.get("target") is not None
+    }
     gids = tuple(nodes["gid"].astype(str))
     visible = set(gids)
     edge_set = edges[edges.src.isin(visible) & edges.dst.isin(visible)].copy()
@@ -114,6 +142,12 @@ def build_network(nodes: pd.DataFrame, edges: pd.DataFrame, color_by: str, show_
         add_lines(focus_edges, "rgba(67,141,176,.82)", 1.8, "Selected customer flows")
     else:
         add_lines(edge_set, "rgba(102,119,137,.32)", .7, "Directed flows")
+    if highlighted_edge_pairs:
+        agent_edges = edge_set[[
+            (str(src), str(dst)) in highlighted_edge_pairs
+            for src, dst in edge_set[["src", "dst"]].itertuples(index=False, name=None)
+        ]]
+        add_lines(agent_edges, "#d69a32", 3.2, "Agent-highlighted flows")
 
     color_col = "role" if color_by == "Role" else "cluster_id"
     cl_vals = sorted(nodes.cluster_id.astype(str).unique(), key=lambda x: (not x.lstrip("-").isdigit(), int(x) if x.lstrip("-").isdigit() else x))
@@ -141,13 +175,15 @@ def build_network(nodes: pd.DataFrame, edges: pd.DataFrame, color_by: str, show_
         hover = [f"<b>GID {r.gid}</b><br>Role: {r.role}<br>Cluster: {r.cluster_id}<br>Priority: {float(r.priority_score):.3f}<br>Depth: {display_num(r.depth)} · Seed: {'Yes' if bool(r.is_seed) else 'No'}<br>In / out: {display_num(r.in_deg)} / {display_num(r.out_deg)}<br>Incoming: {display_num(r.in_kzt)} KZT<br>Outgoing: {display_num(r.out_kzt)} KZT" for r in group.itertuples()]
         sizes = [22 + min(13, max(0, float(x) * 13)) for x in group.priority_score]
         sizes = [size * 1.3 if flag else size for size, flag in zip(sizes, selected)]
-        opacity = [1.0 if (sel or con or not focus_gid) else .14 for sel, con in zip(selected, connected)]
+        highlighted = group.gid.astype(str).isin(highlighted_gids)
+        opacity = [1.0 if (sel or con or marked or not focus_gid) else .14
+                   for sel, con, marked in zip(selected, connected, highlighted)]
         fig.add_trace(go.Scatter(x=[positions[str(g)][0] for g in group.gid], y=[positions[str(g)][1] for g in group.gid],
             mode="markers+text" if show_labels else "markers", text=group.gid if show_labels else None,
             textposition="top center", textfont={"size": 8, "color": "#475467"}, customdata=custom,
             hovertext=hover, hoverinfo="text", name=val, marker={"size": sizes, "color": color, "opacity": opacity,
-            "line": {"width": [3 if s else (1.8 if c else .45) for s, c in zip(selected, connected)],
-                     "color": ["#f8fafc" if s else ("#438db0" if c else "rgba(255,255,255,.6)") for s, c in zip(selected, connected)]}}))
+            "line": {"width": [3 if s else (2.6 if marked else (1.8 if c else .45)) for s, c, marked in zip(selected, connected, highlighted)],
+                     "color": ["#f8fafc" if s else ("#d69a32" if marked else ("#438db0" if c else "rgba(255,255,255,.6)")) for s, c, marked in zip(selected, connected, highlighted)]}}))
     fig.update_layout(height=610, margin={"l": 4, "r": 4, "t": 10, "b": 10}, paper_bgcolor="white", plot_bgcolor="white",
         font={"color": "#344054", "family": "Arial"}, legend={"orientation": "h", "y": -0.03, "font": {"size": 10}},
         clickmode="event+select", xaxis={"visible": False}, yaxis={"visible": False, "scaleanchor": "x", "scaleratio": 1},
@@ -236,9 +272,10 @@ def main() -> None:
     <h1>Flow Atlas</h1><p>Explore observed money flows, customer roles, and network evidence.</p></div>
     """, unsafe_allow_html=True)
     try:
+        graph_service = get_graph_service()
         raw_nodes, edges, annotations, top = load_data()
     except Exception as exc:
-        st.error(f"Unable to load the supplied parquet data and exports: {exc}")
+        st.error(f"Unable to prepare the transaction network: {exc}")
         st.stop()
     nodes = raw_nodes.merge(annotations, on="gid", how="left", suffixes=("", "_analysis"))
     # Prefer the analysis export for derived values and preserve missing values explicitly.
@@ -338,7 +375,11 @@ def main() -> None:
                     graph_nodes = pd.concat([filtered, nodes[nodes.gid.astype(str).isin(extra_ids)]], ignore_index=True).drop_duplicates("gid")
                     graph_edges = pd.concat([filtered_edges, focus_edges], ignore_index=True).drop_duplicates(["src", "dst"])
                     st.caption("The selected customer and direct counterparties stay visible even when they fall outside the current role or cluster filter.")
-            fig = build_network(graph_nodes, graph_edges, color_by, show_labels, selected_gid, neighborhood_only)
+            fig = build_network(
+                graph_nodes, graph_edges, color_by, show_labels, selected_gid, neighborhood_only,
+                set(st.session_state.get("agent_highlight_nodes", [])),
+            st.session_state.get("agent_highlight_edges", []),
+            )
             event = st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True},
                                     on_select="rerun", selection_mode="points", key="network_plot")
             points = getattr(event, "selection", {}).get("points", []) if event else []
@@ -395,6 +436,55 @@ def main() -> None:
             if chosen != selected_gid: select_gid(chosen)
         render_inspector(str(st.session_state.get("selected_gid", "")), nodes, edges, annotations, "inspector")
         st.caption("Observed values describe the supplied extract. Seed incompleteness and depth-cutoff truncation limit interpretation.")
+    st.divider()
+    st.markdown("## Analyst Assistant")
+    st.caption("Ask questions about the observed network. Answers use deterministic graph analysis tools.")
+    try:
+        analyst_agent = get_analyst_agent()
+        assistant_available = True
+    except RuntimeError as exc:
+        assistant_available = False
+        st.info(f"AI analyst is unavailable: {exc}")
+
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+    for message in st.session_state["chat_messages"]:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            if message.get("tool_calls"):
+                with st.expander("How this answer was generated"):
+                    st.json(message["tool_calls"])
+
+    question = st.chat_input(
+        "Ask about roles, flows, clusters, or a GID...",
+        disabled=not assistant_available,
+    )
+    if question:
+        history = st.session_state["chat_messages"][-12:]
+        st.session_state["chat_messages"].append({"role": "user", "content": question})
+        try:
+            response = analyst_agent.ask(question, history)
+        except Exception as exc:
+            st.session_state["chat_messages"].append({
+                "role": "assistant",
+                "content": f"I could not complete the analysis request: {exc}",
+                "tool_calls": [],
+            })
+        else:
+            st.session_state["chat_messages"].append({
+                "role": "assistant",
+                "content": response.answer,
+                "tool_calls": response.tool_calls,
+            })
+            if response.visualization:
+                focus = response.visualization.get("focus_node")
+                if focus is not None and str(focus) in set(nodes.gid.astype(str)):
+                    st.session_state["selected_gid"] = str(focus)
+                    st.session_state["agent_highlight_nodes"] = [
+                        str(gid) for gid in response.visualization.get("highlight_nodes", [])
+                    ]
+                    st.session_state["agent_highlight_edges"] = response.visualization.get("highlight_edges", [])
+        st.rerun()
 
 
 if __name__ == "__main__":

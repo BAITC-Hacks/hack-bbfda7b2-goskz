@@ -80,7 +80,12 @@ class GraphToolService:
         roles_path = output_dir / "nodes_roles.csv"
         required_columns = {"gid", "role", "cluster_id", "priority_score", "in_deg", "out_deg", "in_kzt", "out_kzt", "pagerank"}
         required_artifacts = ("nodes_roles.csv", "clusters.csv", "top_nodes.csv", "network.html")
-        if roles_path.is_file() and all((output_dir / name).is_file() for name in required_artifacts):
+        source_mtime = max(path.stat().st_mtime for path in data_dir.glob("*.parquet"))
+        artifacts_exist = all((output_dir / name).is_file() for name in required_artifacts)
+        artifacts_current = artifacts_exist and all(
+            (output_dir / name).stat().st_mtime >= source_mtime for name in required_artifacts
+        )
+        if roles_path.is_file() and artifacts_current:
             node_data = pd.read_csv(roles_path)
             if not required_columns.issubset(node_data.columns):
                 node_data = pd.DataFrame()
