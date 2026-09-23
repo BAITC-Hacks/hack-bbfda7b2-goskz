@@ -10,6 +10,7 @@ adapters can be plugged in without changing the visualization.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from streamlit.components.v2 import component
-from loading import show_loading
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -270,8 +270,10 @@ def build_figure(
         focus_x, focus_y = edge_coordinates(focused_edges)
         fig.add_trace(go.Scatter(x=focus_x, y=focus_y, mode="lines", line={"width": 2.2, "color": "rgba(56,189,248,.88)"}, hoverinfo="skip", name="Connected flows"))
 
-    # Arrow markers placed along directed edges communicate money-flow direction.
-    annotations = []
+    # Arrow markers are added after the node traces so they render above nodes.
+    arrow_x: list[float] = []
+    arrow_y: list[float] = []
+    arrow_angles: list[float] = []
     # Keep arrow decorations focused on the selected node. When there is no
     # selection, sample the wider graph so Plotly stays responsive.
     if selected:
@@ -283,11 +285,10 @@ def build_figure(
     for source, target in arrow_edges[["src", "dst"]].itertuples(index=False, name=None):
         x0, y0 = positions[str(source)]
         x1, y1 = positions[str(target)]
-        annotations.append({"x": x0 + (x1 - x0) * 0.68, "y": y0 + (y1 - y0) * 0.68,
-                            "ax": x0 + (x1 - x0) * 0.52, "ay": y0 + (y1 - y0) * 0.52,
-                            "xref": "x", "yref": "y", "axref": "x", "ayref": "y",
-                            "showarrow": True, "arrowhead": 2, "arrowsize": 0.9, "arrowwidth": 1.25,
-                            "arrowcolor": "#7dd3fc" if selected else "rgba(148,163,184,.42)"})
+        arrow_x.append(x0 + (x1 - x0) * 0.62)
+        arrow_y.append(y0 + (y1 - y0) * 0.62)
+        # Plotly angles are clockwise from up: atan2(dx, dy) points along the edge.
+        arrow_angles.append(math.degrees(math.atan2(x1 - x0, y1 - y0)))
 
     color_column = "role" if color_by == "Role" else "cluster_id"
     if selected and selected not in set(nodes["gid"].astype(str)):
@@ -317,11 +318,20 @@ def build_figure(
                     "line": {"width": [3 if flag else (1.4 if connected else 0.35) for flag, connected in zip(selected_flags, connected_flags)],
                              "color": ["#ffffff" if flag else ("#38bdf8" if connected else "rgba(15,23,42,.5)") for flag, connected in zip(selected_flags, connected_flags)]}},
         ))
+    if arrow_x:
+        arrow_color = "#7dd3fc" if selected else "rgba(203,213,225,.78)"
+        fig.add_trace(go.Scatter(
+            x=arrow_x, y=arrow_y, mode="markers", hoverinfo="skip", showlegend=False,
+            marker={"symbol": "triangle-up", "size": 9 if selected else 7,
+                    "angle": arrow_angles, "angleref": "up", "color": arrow_color,
+                    "line": {"width": 0.5, "color": "#e0f2fe" if selected else "#cbd5e1"}},
+            name="Flow direction",
+        ))
     fig.update_layout(
         height=690, margin={"l": 8, "r": 8, "t": 12, "b": 8},
         paper_bgcolor="#0b1220", plot_bgcolor="#0b1220", font={"color": "#e2e8f0"},
         legend={"orientation": "h", "y": -0.06, "x": 0, "font": {"size": 10}},
-        annotations=annotations, clickmode="event+select",
+        clickmode="event+select",
         xaxis={"visible": False, "fixedrange": False}, yaxis={"visible": False, "fixedrange": False, "scaleanchor": "x", "scaleratio": 1},
         dragmode="pan", uirevision="network-layout",
     )
@@ -344,6 +354,13 @@ def sync_dropdown_focus() -> None:
     st.session_state["_dismissed_search_gid"] = ""
 
 
+def clear_network_focus() -> None:
+    st.session_state["_active_gid"] = ""
+    st.session_state["selected_gid"] = None
+    st.session_state["gid_search"] = ""
+    st.session_state["_dismissed_search_gid"] = ""
+
+
 def on_network_interaction_change() -> None:
     """The component trigger is consumed in the main app execution."""
 
@@ -355,7 +372,6 @@ def main() -> None:
     if dismissed_search_gid and current_search.casefold() == str(dismissed_search_gid).casefold():
         st.session_state["gid_search"] = ""
     st.session_state["_dismissed_search_gid"] = ""
-    loading_screen = show_loading()
     app_styles = """
     <style>
       .stApp { background: #070d18; color: #e2e8f0; }
@@ -373,6 +389,7 @@ def main() -> None:
     <div class="hero"><div class="eyebrow">NETWORK INTELLIGENCE / DEMO</div>
     <h1>Flow Atlas</h1><p>Explore entities, clusters, and the direction of value moving through the network.</p></div>
     """
+    st.markdown(app_styles + hero, unsafe_allow_html=True)
 
     with st.sidebar:
         st.markdown("### ◉ Network controls")
@@ -398,14 +415,11 @@ def main() -> None:
         show_labels = st.toggle("Show gid labels", value=False)
         st.caption(f"Data source · {source_label}")
 
-    # Compute the initial force layout while the loading screen is visible.
+    # Prime the cached layout once so later filter changes reuse coordinates.
     layout_positions(
         tuple(nodes["gid"].astype(str)),
         tuple((str(src), str(dst)) for src, dst in raw_edges[["src", "dst"]].itertuples(index=False, name=None)),
     )
-    loading_screen.empty()
-    st.markdown(app_styles + hero, unsafe_allow_html=True)
-
     filtered_nodes = nodes[nodes["role"].astype(str).isin(selected_roles) & nodes["cluster_id"].astype(str).isin(selected_clusters)].copy()
     filtered_ids = set(filtered_nodes["gid"].astype(str))
     filtered_edges = raw_edges[raw_edges["src"].isin(filtered_ids) & raw_edges["dst"].isin(filtered_ids)].copy()
@@ -436,7 +450,9 @@ def main() -> None:
 
     graph_col, details_col = st.columns([3.5, 1.05], gap="large")
     with graph_col:
-        st.markdown("#### Network map")
+        graph_heading, clear_column = st.columns([4, 1])
+        graph_heading.markdown("#### Network map")
+        clear_column.button("Clear selection", on_click=clear_network_focus, use_container_width=True)
         st.caption("Click a node to focus its connections · drag to move · scroll to zoom · arrows show flow direction")
         fig = build_figure(nodes, raw_edges, filtered_nodes, filtered_edges, focus_gid, color_by, show_labels)
         chart_result = network_chart(
@@ -473,9 +489,10 @@ def main() -> None:
         st.markdown("#### Entity details")
         available_ids = filtered_nodes["gid"].astype(str).tolist()
         if available_ids:
-            if st.session_state.get("selected_gid") not in available_ids:
+            if "selected_gid" in st.session_state and st.session_state["selected_gid"] not in available_ids:
                 st.session_state["selected_gid"] = None
-            chosen = st.selectbox("Select a gid", available_ids, index=available_ids.index(focus_gid) if focus_gid in available_ids else None, placeholder="Choose a gid…", key="selected_gid", on_change=sync_dropdown_focus)
+            selectbox_options = {"index": None} if "selected_gid" not in st.session_state else {}
+            chosen = st.selectbox("Select a gid", available_ids, placeholder="Choose a gid…", key="selected_gid", on_change=sync_dropdown_focus, **selectbox_options)
             selected_gid = focus_gid or chosen or ""
         if selected_gid:
             row_df = nodes[nodes["gid"] == selected_gid]
