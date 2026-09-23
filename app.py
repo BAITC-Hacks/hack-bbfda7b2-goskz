@@ -43,6 +43,7 @@ setTimeout(() => {
     components.html(html, height=720, scrolling=True)
 
 
+
 def main() -> None:
     st.set_page_config(page_title="AML Analyst Assistant", layout="wide")
     st.title("AML Analyst Assistant")

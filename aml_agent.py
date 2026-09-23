@@ -84,6 +84,7 @@ class AMLAnalystAgent:
                 found.update(AMLAnalystAgent._collect_gids(item))
         return found
 
+
     @staticmethod
     def _visualization(result: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(result, dict) or not result.get("found", True):

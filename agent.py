@@ -78,6 +78,7 @@ def build_graph(edges) -> nx.DiGraph:
     return G
 
 
+
 def basic_features(G: nx.DiGraph, nodes: pd.DataFrame) -> pd.DataFrame:
     """Базовые метрики. Это старт, а не финиш — добавляйте свои."""
     in_deg = dict(G.in_degree())

@@ -55,3 +55,4 @@ class ToolRegistry:
         if unknown:
             raise ValueError(f"unexpected arguments for {name}: {sorted(unknown)}")
         return self._handlers[name](**arguments)
+

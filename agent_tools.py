@@ -103,6 +103,7 @@ class GraphToolService:
             for key, row in grouped.iterrows()
         }
 
+
     @staticmethod
     def _gid(value: Any) -> int:
         if isinstance(value, bool):

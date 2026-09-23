@@ -306,85 +306,18 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     roles["pass_through"] = roles["pass_through"].fillna(0.0)
     roles.to_csv(out_dir / "nodes_roles.csv", index=False)
 
-<<<<<<< HEAD
     write_clusters(roles, G, out_dir)
     write_top_nodes(roles, out_dir)
     write_network_html(roles, G, out_dir)
 
     # 2. clusters.csv — пустой каркас
-
-    # 3. top_nodes.csv — пустой каркас, нужно ≥20 строк
-=======
-    # 2. Summarize each community. Louvain used the undirected projection,
-    # while internal KZT is totaled from the original directed edge list.
-    feature_by_gid = df.set_index("gid")
-    cluster_rows = []
-    for cluster_id, community in enumerate(communities):
-        members = set(community)
-        internal = [(u, v, data) for u, v, data in G.edges(data=True)
-                    if u in members and v in members]
-        internal_kzt = sum(data["sum_kzt"] for _, _, data in internal)
-        member_features = feature_by_gid.loc[list(members)]
-        member_flow = {gid: 0.0 for gid in members}
-        for src, dst, data in internal:
-            member_flow[src] += data["sum_kzt"]
-            member_flow[dst] += data["sum_kzt"]
-        top_gids = sorted(members, key=lambda gid: (-member_flow[gid], str(gid)))[:5]
-        n_nodes = len(members)
-        n_seed = int(member_features["is_seed"].astype(bool).sum())
-        in_and_out = int(((member_features.in_deg > 0) & (member_features.out_deg > 0)).sum())
-        multi_counterparty = int(((member_features.in_deg >= 2) | (member_features.out_deg >= 2)).sum())
-        truncated = int(member_features["truncated_by_depth"].astype(bool).sum())
-
-        if n_nodes == 1 and not internal:
-            hypothesis = "Singleton customer with no observed transfer links; no group-level pattern can be inferred."
-        elif in_and_out >= max(2, int(np.ceil(n_nodes / 2))):
-            hypothesis = (f"Observed flows connect many members: {in_and_out}/{n_nodes} have both incoming and outgoing edges; "
-                          f"{multi_counterparty}/{n_nodes} have 2+ counterparties on at least one side. "
-                          "This may reflect transit or exchange activity.")
-        elif multi_counterparty >= max(2, int(np.ceil(n_nodes / 2))):
-            hypothesis = (f"{multi_counterparty}/{n_nodes} members have 2+ counterparties on at least one side; "
-                          f"the observed pattern may reflect collection or distribution activity ({internal_kzt:,.0f} KZT internal).")
-        else:
-            hypothesis = (f"Observed links are comparatively sparse ({len(internal)} directed pairs; {internal_kzt:,.0f} KZT internal); "
-                          "available evidence does not support a more specific purpose hypothesis.")
-        if truncated:
-            hypothesis += f" {truncated} member(s) are depth-4 endpoints, so onward flows may be unobserved."
-        if n_seed:
-            hypothesis += f" Includes {n_seed} seed customer(s), whose incoming flows may be incomplete."
-        cluster_rows.append({
-            "cluster_id": cluster_id,
-            "n_nodes": n_nodes,
-            "n_seed": n_seed,
-            "sum_kzt_internal": internal_kzt,
-            "top_gids": ",".join(map(str, top_gids)),
-            "hypothesis": hypothesis,
-        })
-    pd.DataFrame(cluster_rows, columns=["cluster_id", "n_nodes", "n_seed",
-                                       "sum_kzt_internal", "top_gids", "hypothesis"]) \
+    pd.DataFrame(columns=["cluster_id", "n_nodes", "n_seed",
+                          "sum_kzt_internal", "top_gids", "hypothesis"]) \
         .to_csv(out_dir / "clusters.csv", index=False)
 
-    # 3. Rank customers by the existing role/volume/PageRank priority score.
-    # Reasons expose the directed counts and amounts behind each individual row.
-    ranked = roles.sort_values(["priority_score", "gid"], ascending=[False, True]).copy()
-    ranked_features = df.set_index("gid")
-    why = []
-    for row in ranked.itertuples(index=False):
-        f = ranked_features.loc[row.gid]
-        pass_ratio = "n/a" if pd.isna(f.pass_through) else f"{f.pass_through:.2f}"
-        explanation = (f"{row.role}; incoming {int(f.in_deg)} counterparties/{f.in_kzt:,.0f} KZT, "
-                       f"outgoing {int(f.out_deg)} counterparties/{f.out_kzt:,.0f} KZT; "
-                       f"pass-through {pass_ratio}; PageRank {f.pagerank:.5g}; cluster {row.cluster_id}.")
-        if bool(f.is_seed):
-            explanation += " Seed incoming-flow coverage may be incomplete."
-        if bool(f.truncated_by_depth):
-            explanation += " Depth-4 endpoint may have unobserved onward transfers."
-        why.append(explanation)
-    ranked["why"] = why
-    top_nodes = ranked.head(min(50, len(ranked)))[["gid", "role", "priority_score", "why"]].copy()
-    top_nodes.insert(0, "rank", np.arange(1, len(top_nodes) + 1))
-    top_nodes.to_csv(out_dir / "top_nodes.csv", index=False)
->>>>>>> d95d41583f50b1596325ea9b30c623161d7e3e42
+    # 3. top_nodes.csv — пустой каркас, нужно ≥20 строк
+    pd.DataFrame(columns=["rank", "gid", "role", "priority_score", "why"]) \
+        .to_csv(out_dir / "top_nodes.csv", index=False)
 
     print(f"Выгрузки записаны в {out_dir}/")
 
