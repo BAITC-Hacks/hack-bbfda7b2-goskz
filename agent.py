@@ -21,14 +21,13 @@
 import argparse
 import json
 from pathlib import Path
-import os
+
 import numpy as np
 import pandas as pd
 import networkx as nx
-from dotenv import load_dotenv 
-from openai import OpenAI
 
 ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "peripheral"]
+
 
 # ---------------------------------------------------------------- загрузка
 
@@ -293,6 +292,7 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     # 3. top_nodes.csv — пустой каркас, нужно ≥20 строк
 
     print(f"Выгрузки записаны в {out_dir}/  (роли пока пустые — это ваша задача)")
+
 
 # ---------------------------------------------------------------- подсказки
 
