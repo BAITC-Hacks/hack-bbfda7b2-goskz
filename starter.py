@@ -33,7 +33,7 @@ ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "p
 # ---------------------------------------------------------------- загрузка
 
 def load(data_dir: Path):
-    data_dir=Path("parquet")
+    data_dir = Path(data_dir)
     edges = pd.read_parquet(data_dir / "edges.parquet")
     nodes = pd.read_parquet(data_dir / "nodes.parquet")
     tx = pd.read_parquet(data_dir / "transactions.parquet")
@@ -87,7 +87,25 @@ def basic_features(G: nx.DiGraph, nodes: pd.DataFrame) -> pd.DataFrame:
     out_kzt = dict(G.out_degree(weight="sum_kzt"))
     in_tx = dict(G.in_degree(weight="n_tx"))
     out_tx = dict(G.out_degree(weight="n_tx"))
-    pr = nx.pagerank(G, weight="sum_kzt")
+    # Weighted PageRank power iteration, avoiding NetworkX's optional SciPy
+    # dependency. This matches the standard alpha=.85, uniform-dangling setup.
+    alpha = 0.85
+    graph_nodes = list(G.nodes())
+    n_graph_nodes = len(graph_nodes)
+    pr = {gid: 1.0 / n_graph_nodes for gid in graph_nodes} if n_graph_nodes else {}
+    out_weight = {gid: sum(data["sum_kzt"] for _, _, data in G.out_edges(gid, data=True))
+                  for gid in graph_nodes}
+    for _ in range(100):
+        dangling = sum(pr[gid] for gid in graph_nodes if out_weight[gid] == 0)
+        updated = {gid: (1.0 - alpha) / n_graph_nodes + alpha * dangling / n_graph_nodes
+                   for gid in graph_nodes}
+        for src, dst, data in G.edges(data=True):
+            if out_weight[src] > 0:
+                updated[dst] += alpha * pr[src] * data["sum_kzt"] / out_weight[src]
+        error = sum(abs(updated[gid] - pr[gid]) for gid in graph_nodes)
+        pr = updated
+        if error < 1e-12:
+            break
 
     df = nodes[["gid", "depth", "is_seed"]].copy()
     df["in_deg"] = df.gid.map(in_deg).fillna(0).astype(int)
@@ -238,8 +256,9 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
         default=0.0,
     )
     # Louvain works on an undirected projection; aggregate reciprocal flows.
+    # Include isolated input customers so none are assigned cluster_id=-1.
     UG = nx.Graph()
-    UG.add_nodes_from(G)
+    UG.add_nodes_from(df.gid)
     for src, dst, data in G.edges(data=True):
         weight = data["sum_kzt"]
         if UG.has_edge(src, dst):
@@ -252,7 +271,7 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
         for cluster_id, community in enumerate(communities)
         for gid in community
     }
-    roles["cluster_id"] = roles["gid"].map(cluster_by_gid).fillna(-1).astype(int)
+    roles["cluster_id"] = roles["gid"].map(cluster_by_gid).astype(int)
     total_kzt = df["in_kzt"] + df["out_kzt"]
     log_volume = np.log1p(total_kzt)
     volume_score = log_volume / log_volume.max() if log_volume.max() > 0 else log_volume
@@ -282,8 +301,12 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
         df[["gid", "in_deg", "out_deg", "in_kzt", "out_kzt", "pagerank",
             "pass_through", "depth", "is_seed", "truncated_by_depth"]],
         on="gid", how="left")
+    # The ratio is undefined without observed incoming KZT; export 0 as a
+    # numeric sentinel, with in_deg/in_kzt preserving the reason it is undefined.
+    roles["pass_through"] = roles["pass_through"].fillna(0.0)
     roles.to_csv(out_dir / "nodes_roles.csv", index=False)
 
+<<<<<<< HEAD
     write_clusters(roles, G, out_dir)
     write_top_nodes(roles, out_dir)
     write_network_html(roles, G, out_dir)
@@ -291,8 +314,79 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     # 2. clusters.csv — пустой каркас
 
     # 3. top_nodes.csv — пустой каркас, нужно ≥20 строк
+=======
+    # 2. Summarize each community. Louvain used the undirected projection,
+    # while internal KZT is totaled from the original directed edge list.
+    feature_by_gid = df.set_index("gid")
+    cluster_rows = []
+    for cluster_id, community in enumerate(communities):
+        members = set(community)
+        internal = [(u, v, data) for u, v, data in G.edges(data=True)
+                    if u in members and v in members]
+        internal_kzt = sum(data["sum_kzt"] for _, _, data in internal)
+        member_features = feature_by_gid.loc[list(members)]
+        member_flow = {gid: 0.0 for gid in members}
+        for src, dst, data in internal:
+            member_flow[src] += data["sum_kzt"]
+            member_flow[dst] += data["sum_kzt"]
+        top_gids = sorted(members, key=lambda gid: (-member_flow[gid], str(gid)))[:5]
+        n_nodes = len(members)
+        n_seed = int(member_features["is_seed"].astype(bool).sum())
+        in_and_out = int(((member_features.in_deg > 0) & (member_features.out_deg > 0)).sum())
+        multi_counterparty = int(((member_features.in_deg >= 2) | (member_features.out_deg >= 2)).sum())
+        truncated = int(member_features["truncated_by_depth"].astype(bool).sum())
 
-    print(f"Выгрузки записаны в {out_dir}/  (роли пока пустые — это ваша задача)")
+        if n_nodes == 1 and not internal:
+            hypothesis = "Singleton customer with no observed transfer links; no group-level pattern can be inferred."
+        elif in_and_out >= max(2, int(np.ceil(n_nodes / 2))):
+            hypothesis = (f"Observed flows connect many members: {in_and_out}/{n_nodes} have both incoming and outgoing edges; "
+                          f"{multi_counterparty}/{n_nodes} have 2+ counterparties on at least one side. "
+                          "This may reflect transit or exchange activity.")
+        elif multi_counterparty >= max(2, int(np.ceil(n_nodes / 2))):
+            hypothesis = (f"{multi_counterparty}/{n_nodes} members have 2+ counterparties on at least one side; "
+                          f"the observed pattern may reflect collection or distribution activity ({internal_kzt:,.0f} KZT internal).")
+        else:
+            hypothesis = (f"Observed links are comparatively sparse ({len(internal)} directed pairs; {internal_kzt:,.0f} KZT internal); "
+                          "available evidence does not support a more specific purpose hypothesis.")
+        if truncated:
+            hypothesis += f" {truncated} member(s) are depth-4 endpoints, so onward flows may be unobserved."
+        if n_seed:
+            hypothesis += f" Includes {n_seed} seed customer(s), whose incoming flows may be incomplete."
+        cluster_rows.append({
+            "cluster_id": cluster_id,
+            "n_nodes": n_nodes,
+            "n_seed": n_seed,
+            "sum_kzt_internal": internal_kzt,
+            "top_gids": ",".join(map(str, top_gids)),
+            "hypothesis": hypothesis,
+        })
+    pd.DataFrame(cluster_rows, columns=["cluster_id", "n_nodes", "n_seed",
+                                       "sum_kzt_internal", "top_gids", "hypothesis"]) \
+        .to_csv(out_dir / "clusters.csv", index=False)
+
+    # 3. Rank customers by the existing role/volume/PageRank priority score.
+    # Reasons expose the directed counts and amounts behind each individual row.
+    ranked = roles.sort_values(["priority_score", "gid"], ascending=[False, True]).copy()
+    ranked_features = df.set_index("gid")
+    why = []
+    for row in ranked.itertuples(index=False):
+        f = ranked_features.loc[row.gid]
+        pass_ratio = "n/a" if pd.isna(f.pass_through) else f"{f.pass_through:.2f}"
+        explanation = (f"{row.role}; incoming {int(f.in_deg)} counterparties/{f.in_kzt:,.0f} KZT, "
+                       f"outgoing {int(f.out_deg)} counterparties/{f.out_kzt:,.0f} KZT; "
+                       f"pass-through {pass_ratio}; PageRank {f.pagerank:.5g}; cluster {row.cluster_id}.")
+        if bool(f.is_seed):
+            explanation += " Seed incoming-flow coverage may be incomplete."
+        if bool(f.truncated_by_depth):
+            explanation += " Depth-4 endpoint may have unobserved onward transfers."
+        why.append(explanation)
+    ranked["why"] = why
+    top_nodes = ranked.head(min(50, len(ranked)))[["gid", "role", "priority_score", "why"]].copy()
+    top_nodes.insert(0, "rank", np.arange(1, len(top_nodes) + 1))
+    top_nodes.to_csv(out_dir / "top_nodes.csv", index=False)
+>>>>>>> d95d41583f50b1596325ea9b30c623161d7e3e42
+
+    print(f"Выгрузки записаны в {out_dir}/")
 
 # ---------------------------------------------------------------- подсказки
 
@@ -320,15 +414,18 @@ def hints(G: nx.DiGraph, df: pd.DataFrame):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="../data", help="папка с parquet-файлами")
-    ap.add_argument("--out", default="./out", help="куда писать выгрузки")
+    ap.add_argument("--data", default=None, help="папка с parquet-файлами (по умолчанию рядом со скриптом: parquet)")
+    ap.add_argument("--out", default=None, help="куда писать выгрузки (по умолчанию рядом со скриптом: out)")
     a = ap.parse_args()
 
-    edges, nodes, tx = load(Path(a.data))
+    project_dir = Path(__file__).resolve().parent
+    data_dir = Path(a.data) if a.data else project_dir / "parquet"
+    out_dir = Path(a.out) if a.out else project_dir / "out"
+    edges, nodes, tx = load(data_dir)
     sanity_check(edges, nodes, tx)
     G = build_graph(edges)
     df = basic_features(G, nodes)
-    write_outputs(df, Path(a.out), G)
+    write_outputs(df, out_dir, G)
     hints(G, df)
 
 
