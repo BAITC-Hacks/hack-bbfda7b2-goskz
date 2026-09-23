@@ -216,60 +216,70 @@ def assign_roles(df: pd.DataFrame) -> pd.DataFrame:
     return f
 
 def write_clusters(roles: pd.DataFrame, G: nx.DiGraph, out_dir: Path):
-    """Write one aggregate record for every Louvain community."""
-    membership = roles.set_index("gid")["cluster_id"]
-    edge_frame = pd.DataFrame(
-        ((src, dst, data["sum_kzt"]) for src, dst, data in G.edges(data=True)),
-        columns=["src", "dst", "sum_kzt"],
-    )
-    edge_frame["src_cluster"] = edge_frame["src"].map(membership)
-    edge_frame["dst_cluster"] = edge_frame["dst"].map(membership)
-    internal_kzt = (
-        edge_frame[edge_frame["src_cluster"].eq(edge_frame["dst_cluster"])]
-        .groupby("src_cluster")["sum_kzt"].sum()
-    )
-
-    labels = {
-        "consolidator": "кластер накопления средств",
-        "transit": "транзитный кластер",
-        "distributor": "кластер распределения",
-        "terminal": "кластер конечных получателей",
-        "coordinator": "координационный кластер",
-        "peripheral": "периферийный кластер",
-    }
-    rows = []
+    """Write community summaries with flow evidence and cautious hypotheses."""
+    feature_by_gid = roles.set_index("gid")
+    cluster_rows = []
     for cluster_id, group in roles.groupby("cluster_id", sort=True):
-        role_counts = group["role"].value_counts()
-        main_role = role_counts.index[0]
-        top_gids = group.nlargest(5, "priority_score")["gid"].astype(str).tolist()
-        rows.append({
+        members = set(group["gid"])
+        internal = [(u, v, data) for u, v, data in G.edges(data=True)
+                    if u in members and v in members]
+        internal_kzt = sum(data["sum_kzt"] for _, _, data in internal)
+        member_features = feature_by_gid.loc[list(members)]
+        member_flow = {gid: 0.0 for gid in members}
+        for src, dst, data in internal:
+            member_flow[src] += data["sum_kzt"]
+            member_flow[dst] += data["sum_kzt"]
+        top_gids = sorted(members, key=lambda gid: (-member_flow[gid], str(gid)))[:5]
+        n_nodes = len(members)
+        n_seed = int(member_features["is_seed"].astype(bool).sum())
+        in_and_out = int(((member_features.in_deg > 0) & (member_features.out_deg > 0)).sum())
+        multi_counterparty = int(((member_features.in_deg >= 2) | (member_features.out_deg >= 2)).sum())
+        truncated = int(member_features["truncated_by_depth"].astype(bool).sum())
+
+        if n_nodes == 1 and not internal:
+            hypothesis = "Singleton customer with no observed transfer links; no group-level pattern can be inferred."
+        elif in_and_out >= max(2, int(np.ceil(n_nodes / 2))):
+            hypothesis = (f"Observed flows connect many members: {in_and_out}/{n_nodes} have both incoming and outgoing edges; "
+                          f"{multi_counterparty}/{n_nodes} have 2+ counterparties on at least one side. "
+                          "This may reflect transit or exchange activity.")
+        elif multi_counterparty >= max(2, int(np.ceil(n_nodes / 2))):
+            hypothesis = (f"{multi_counterparty}/{n_nodes} members have 2+ counterparties on at least one side; "
+                          f"the observed pattern may reflect collection or distribution activity ({internal_kzt:,.0f} KZT internal).")
+        else:
+            hypothesis = (f"Observed links are comparatively sparse ({len(internal)} directed pairs; {internal_kzt:,.0f} KZT internal); "
+                          "available evidence does not support a more specific purpose hypothesis.")
+        if truncated:
+            hypothesis += f" {truncated} member(s) are depth-4 endpoints, so onward flows may be unobserved."
+        if n_seed:
+            hypothesis += f" Includes {n_seed} seed customer(s), whose incoming flows may be incomplete."
+        role_mix = member_features["role"].value_counts()
+        mix_text = ", ".join(f"{role}={count}" for role, count in role_mix.items())
+        hypothesis += f" Assigned role mix: {mix_text}."
+        cluster_rows.append({
             "cluster_id": int(cluster_id),
-            "n_nodes": len(group),
-            "n_seed": int(group["is_seed"].sum()),
-            "sum_kzt_internal": float(internal_kzt.get(cluster_id, 0.0)),
-            "top_gids": ",".join(top_gids),
-            "hypothesis": (
-                f"{labels[main_role]}; роль {main_role}: {role_counts.iloc[0]}/{len(group)}, "
-                f"seed: {int(group['is_seed'].sum())}"
-            )[:200],
+            "n_nodes": n_nodes,
+            "n_seed": n_seed,
+            "sum_kzt_internal": internal_kzt,
+            "top_gids": ",".join(map(str, top_gids)),
+            "hypothesis": hypothesis,
         })
-    pd.DataFrame(rows, columns=[
+    pd.DataFrame(cluster_rows, columns=[
         "cluster_id", "n_nodes", "n_seed", "sum_kzt_internal", "top_gids", "hypothesis",
     ]).to_csv(out_dir / "clusters.csv", index=False)
 
 
 def write_top_nodes(roles: pd.DataFrame, out_dir: Path):
-    """Write the twenty highest-priority nodes with their numeric evidence."""
-    top = roles.nlargest(min(20, len(roles)), "priority_score").copy()
-    top.insert(0, "rank", np.arange(1, len(top) + 1))
-    top["why"] = (
-        "cluster=" + top["cluster_id"].astype(str)
-        + "; score=" + top["priority_score"].round(3).astype(str)
-        + "; " + top["evidence"]
-    ).str.slice(0, 200)
-    top[["rank", "gid", "role", "priority_score", "why"]].to_csv(
-        out_dir / "top_nodes.csv", index=False
+    """Write the fifty highest-priority nodes and the evidence behind each rank."""
+    ranked = roles.sort_values(["priority_score", "gid"], ascending=[False, True]).copy()
+    top = ranked.head(min(50, len(ranked)))[
+        ["gid", "role", "priority_score", "evidence", "pagerank", "cluster_id"]
+    ].copy()
+    top["why"] = top.apply(
+        lambda row: f"{row.evidence} PageRank={row.pagerank:.5g}; cluster={row.cluster_id}.", axis=1
     )
+    top = top[["gid", "role", "priority_score", "why"]]
+    top.insert(0, "rank", np.arange(1, len(top) + 1))
+    top.to_csv(out_dir / "top_nodes.csv", index=False)
 
 
 def write_network_html(roles: pd.DataFrame, G: nx.DiGraph, out_dir: Path):
