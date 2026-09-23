@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import colorsys
+import hashlib
+from io import BytesIO
 import sys
 from pathlib import Path
 
@@ -35,14 +37,36 @@ def get_graph_service() -> GraphToolService:
     return GraphToolService.from_project_data(DATA_DIR, OUT_DIR)
 
 
-@st.cache_resource
-def get_analyst_agent() -> AMLAnalystAgent:
-    return AMLAnalystAgent.from_environment(get_graph_service())
+@st.cache_resource(show_spinner="Analyzing uploaded case files…")
+def get_uploaded_case(edge_bytes: bytes, node_bytes: bytes, transaction_bytes: bytes):
+    """Validate uploaded Parquet files and build their graph analysis in memory."""
+    from starter import (
+        basic_features, build_cluster_summaries, build_graph, build_top_nodes,
+        prepare_roles, validate_case_frames,
+    )
+
+    edges = pd.read_parquet(BytesIO(edge_bytes))
+    nodes = pd.read_parquet(BytesIO(node_bytes))
+    transactions = pd.read_parquet(BytesIO(transaction_bytes))
+    edges, nodes, transactions = validate_case_frames(edges, nodes, transactions)
+    graph = build_graph(edges)
+    roles = prepare_roles(basic_features(graph, nodes), graph)
+    service = GraphToolService(graph, transactions, roles)
+    return service, build_top_nodes(roles), build_cluster_summaries(roles, graph)
 
 
-@st.cache_data(show_spinner="Loading supplied network data…")
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    service = get_graph_service()
+def get_analyst_agent(graph_service: GraphToolService, dataset_key: str) -> AMLAnalystAgent:
+    """Keep the assistant attached to the currently selected case dataset."""
+    cache_key = f"analyst_agent:{dataset_key}"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = AMLAnalystAgent.from_environment(graph_service)
+    return st.session_state[cache_key]
+
+
+def load_data(service: GraphToolService | None = None,
+              top_override: pd.DataFrame | None = None
+              ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    service = service or get_graph_service()
     annotations = service.node_data.copy()
     nodes = annotations[["gid", "depth", "is_seed"]].copy()
     edges = pd.DataFrame(
@@ -50,7 +74,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
          for src, dst, data in service.graph.edges(data=True)),
         columns=["src", "dst", "sum_kzt", "n_tx"],
     )
-    top = pd.read_csv(OUT_DIR / "top_nodes.csv")
+    top = top_override.copy() if top_override is not None else pd.read_csv(OUT_DIR / "top_nodes.csv")
     nodes["gid"] = nodes["gid"].astype(str)
     edges["src"] = edges["src"].astype(str)
     edges["dst"] = edges["dst"].astype(str)
@@ -275,11 +299,47 @@ def main() -> None:
     <div class="hero"><div class="eyebrow">Financial network · investigation workspace</div>
     <h1>Flow Atlas</h1><p>Explore observed money flows, customer roles, and network evidence.</p></div>
     """, unsafe_allow_html=True)
+    with st.sidebar:
+        st.markdown("### Case data")
+        st.caption("Use the supplied case data or upload all three Parquet files. Uploaded analysis stays in memory and does not replace the project files.")
+        edges_upload = st.file_uploader("edges.parquet", type=["parquet"], key="case_edges_upload")
+        nodes_upload = st.file_uploader("nodes.parquet", type=["parquet"], key="case_nodes_upload")
+        transactions_upload = st.file_uploader("transactions.parquet", type=["parquet"], key="case_transactions_upload")
+
+    uploads = (edges_upload, nodes_upload, transactions_upload)
+    has_any_upload = any(item is not None for item in uploads)
+    has_all_uploads = all(item is not None for item in uploads)
+    if has_any_upload and not has_all_uploads:
+        st.error("Upload edges.parquet, nodes.parquet, and transactions.parquet together, or clear the uploads to use the supplied case.")
+        st.stop()
+
     try:
-        graph_service = get_graph_service()
-        raw_nodes, edges, annotations, top = load_data()
+        if has_all_uploads:
+            edge_bytes, node_bytes, transaction_bytes = (item.getvalue() for item in uploads)
+            digest = hashlib.sha256()
+            for payload in (edge_bytes, node_bytes, transaction_bytes):
+                digest.update(len(payload).to_bytes(8, "big"))
+                digest.update(payload)
+            dataset_key = digest.hexdigest()
+            graph_service, top_override, cluster_export = get_uploaded_case(
+                edge_bytes, node_bytes, transaction_bytes)
+            dataset_label = "Uploaded Parquet case"
+        else:
+            dataset_key = "provided-case"
+            graph_service = get_graph_service()
+            top_override = None
+            cluster_export = pd.read_csv(OUT_DIR / "clusters.csv")
+            dataset_label = "Supplied project case"
+        if st.session_state.get("_active_dataset_key") != dataset_key:
+            for key in ("selected_gid", "gid_query", "inspector_gid", "top_gid",
+                        "role_filter", "cluster_filter", "neighborhood_only",
+                        "agent_highlight_nodes", "agent_highlight_edges", "chat_messages",
+                        "_last_applied_gid_query"):
+                st.session_state.pop(key, None)
+            st.session_state["_active_dataset_key"] = dataset_key
+        raw_nodes, edges, annotations, top = load_data(graph_service, top_override)
     except Exception as exc:
-        st.error(f"Unable to prepare the transaction network: {exc}")
+        st.error(f"Unable to prepare this transaction network: {exc}")
         st.stop()
     nodes = raw_nodes.merge(annotations, on="gid", how="left", suffixes=("", "_analysis"))
     # Prefer the analysis export for derived values and preserve missing values explicitly.
@@ -315,7 +375,16 @@ def main() -> None:
                 st.success(f"Customer {matches.iloc[0].gid} selected")
         st.divider()
         st.caption("Color and label controls are available in Network.")
-        st.caption("Source: parquet/nodes.parquet, parquet/edges.parquet and out/*.csv")
+        st.caption(f"Source: {dataset_label}")
+        st.markdown("**Download analysis exports**")
+        for filename, frame in (("nodes_roles.csv", annotations),
+                                ("clusters.csv", cluster_export),
+                                ("top_nodes.csv", top)):
+            st.download_button(
+                f"Download {filename}", frame.to_csv(index=False).encode("utf-8-sig"),
+                file_name=filename, mime="text/csv", use_container_width=True,
+                key=f"download_{dataset_key[:12]}_{filename}",
+            )
 
     selected_gid = str(st.session_state.get("selected_gid", ""))
     cluster_pick = st.session_state.get("cluster_filter", "All clusters")
@@ -385,7 +454,8 @@ def main() -> None:
             st.session_state.get("agent_highlight_edges", []),
             )
             event = st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True},
-                                    on_select="rerun", selection_mode="points", key="network_plot")
+                                    on_select="rerun", selection_mode="points",
+                                    key=f"network_plot_{dataset_key[:12]}")
             points = getattr(event, "selection", {}).get("points", []) if event else []
             if points:
                 custom = points[-1].get("customdata")
@@ -409,7 +479,8 @@ def main() -> None:
             view = top.copy()
             view["priority_score"] = pd.to_numeric(view.priority_score, errors="coerce")
             event = st.dataframe(view[[c for c in ["rank", "gid", "role", "priority_score", "why"] if c in view]],
-                hide_index=True, use_container_width=True, height=540, on_select="rerun", selection_mode="single-row", key="top_customer_table")
+                hide_index=True, use_container_width=True, height=540, on_select="rerun", selection_mode="single-row",
+                key=f"top_customer_table_{dataset_key[:12]}")
             rows = getattr(event, "selection", {}).get("rows", []) if event else []
             if rows:
                 select_gid(str(view.iloc[rows[0]].gid))
@@ -445,7 +516,7 @@ def main() -> None:
         st.markdown("### Analyst Assistant")
         st.caption("Ask about observed flows, roles, clusters, or a GID.")
         try:
-            analyst_agent = get_analyst_agent()
+            analyst_agent = get_analyst_agent(graph_service, dataset_key)
             assistant_available = True
         except RuntimeError as exc:
             assistant_available = False

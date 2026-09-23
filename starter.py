@@ -33,6 +33,10 @@ ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "p
 DISTRIBUTOR_RECIPIENTS = 5
 MIN_INCOMING_KZT = 50_000
 TRANSIT_PASS_THROUGH = 0.8
+COORDINATOR_MIN_IN_DEG = 2
+COORDINATOR_MIN_OUT_DEG = 2
+MAX_EVIDENCE_CHARS = 200
+ANALYSIS_VERSION = "2"
 
 
 # ---------------------------------------------------------------- загрузка
@@ -46,8 +50,94 @@ def load(data_dir: Path):
     return edges, nodes, tx
 
 
+def validate_case_frames(edges: pd.DataFrame, nodes: pd.DataFrame,
+                         tx: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Validate and normalize the three fixed-schema case tables."""
+    required = {
+        "edges": {"src", "dst", "sum_kzt", "n_tx", "depth"},
+        "nodes": {"gid", "depth", "is_seed"},
+        "transactions": {"src", "dst", "sum_kzt", "date"},
+    }
+    frames = {"edges": edges.copy(), "nodes": nodes.copy(), "transactions": tx.copy()}
+    for name, columns in required.items():
+        missing = columns - set(frames[name].columns)
+        if missing:
+            raise ValueError(f"{name} data is missing required columns: {', '.join(sorted(missing))}")
+    edges, nodes, tx = frames["edges"], frames["nodes"], frames["transactions"]
+    if edges.empty or nodes.empty or tx.empty:
+        raise ValueError("edges, nodes, and transactions must all contain data")
+    for frame, columns, label in (
+        (nodes, ("gid",), "nodes.gid"),
+        (edges, ("src", "dst"), "edges identifiers"),
+        (tx, ("src", "dst"), "transactions identifiers"),
+    ):
+        for column in columns:
+            numeric = pd.to_numeric(frame[column], errors="coerce")
+            if numeric.isna().any() or (numeric % 1 != 0).any():
+                raise ValueError(f"{label} must contain integer GIDs")
+            try:
+                frame[column] = numeric.astype("int64")
+            except (OverflowError, ValueError) as exc:
+                raise ValueError(f"{label} contains a GID outside the int64 range") from exc
+    if nodes["gid"].isna().any() or nodes["gid"].duplicated().any():
+        raise ValueError("nodes must contain one non-empty row per unique gid")
+    if nodes[["depth", "is_seed"]].isna().any().any():
+        raise ValueError("nodes contains missing values in required fields")
+    if edges[["src", "dst", "sum_kzt", "n_tx", "depth"]].isna().any().any():
+        raise ValueError("edges contains missing values in required fields")
+    if tx[["src", "dst", "sum_kzt", "date"]].isna().any().any():
+        raise ValueError("transactions contains missing values in required fields")
+    if edges.duplicated(["src", "dst"]).any():
+        raise ValueError("edges must contain one aggregated row per directed src/dst pair")
+    if not pd.api.types.is_numeric_dtype(edges["sum_kzt"]) or not pd.api.types.is_numeric_dtype(tx["sum_kzt"]):
+        raise ValueError("sum_kzt must be numeric in edges and transactions")
+    if (not pd.api.types.is_numeric_dtype(edges["n_tx"])
+            or (edges["n_tx"] < 1).any() or (edges["n_tx"] % 1 != 0).any()):
+        raise ValueError("edges.n_tx must be a positive transaction count")
+    if (edges["sum_kzt"] < 0).any() or (tx["sum_kzt"] < 0).any():
+        raise ValueError("transaction amounts cannot be negative")
+    if not np.isfinite(edges[["sum_kzt", "n_tx"]].to_numpy(dtype=float)).all():
+        raise ValueError("edges amounts and counts must be finite")
+    if not np.isfinite(tx["sum_kzt"].to_numpy(dtype=float)).all():
+        raise ValueError("transaction amounts must be finite")
+    for frame, column, label in ((nodes, "depth", "nodes.depth"), (edges, "depth", "edges.depth")):
+        numeric = pd.to_numeric(frame[column], errors="coerce")
+        if numeric.isna().any() or (numeric % 1 != 0).any():
+            raise ValueError(f"{label} must contain integer hop depths")
+        frame[column] = numeric.astype("int64")
+    if not pd.api.types.is_bool_dtype(nodes["is_seed"]):
+        if not nodes["is_seed"].isin([0, 1]).all():
+            raise ValueError("nodes.is_seed must be boolean")
+        nodes["is_seed"] = nodes["is_seed"].astype(bool)
+    try:
+        tx["date"] = pd.to_datetime(tx["date"], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("transactions.date contains an invalid date") from exc
+
+    node_ids = set(nodes["gid"])
+    edge_ids = set(edges["src"]) | set(edges["dst"])
+    if not edge_ids.issubset(node_ids):
+        raise ValueError("every edge endpoint must have a row in nodes")
+    tx_ids = set(tx["src"]) | set(tx["dst"])
+    if not tx_ids.issubset(node_ids):
+        raise ValueError("every transaction endpoint must have a row in nodes")
+
+    aggregate = tx.groupby(["src", "dst"], as_index=False).agg(
+        tx_sum=("sum_kzt", "sum"), tx_count=("sum_kzt", "size"))
+    comparison = edges[["src", "dst", "sum_kzt", "n_tx"]].merge(
+        aggregate, on=["src", "dst"], how="outer", indicator=True)
+    if not comparison["_merge"].eq("both").all():
+        raise ValueError("edges and transactions contain different directed src/dst pairs")
+    if not np.allclose(comparison["sum_kzt"], comparison["tx_sum"], rtol=1e-9, atol=1e-6):
+        raise ValueError("edges.sum_kzt does not match the transaction sums")
+    if not np.array_equal(comparison["n_tx"].astype(int), comparison["tx_count"].astype(int)):
+        raise ValueError("edges.n_tx does not match the number of transactions")
+    return edges, nodes, tx
+
+
 def sanity_check(edges, nodes, tx):
     """Проверки, которые стоит пройти до того, как строить модель."""
+    edges, nodes, tx = validate_case_frames(edges, nodes, tx)
     print("=" * 64)
     print("ПРОВЕРКА ДАННЫХ")
     print("=" * 64)
@@ -58,10 +148,6 @@ def sanity_check(edges, nodes, tx):
     print(f"  оборот, KZT           : {edges.sum_kzt.sum():>14,.0f}")
     print(f"  период                : {tx.date.min().date()} — {tx.date.max().date()}")
 
-    # транзакции должны складываться в рёбра
-    agg = tx.groupby(["src", "dst"]).agg(s=("sum_kzt", "sum"), c=("sum_kzt", "size")).reset_index()
-    m = edges.merge(agg, on=["src", "dst"], how="outer", indicator=True)
-    assert (m._merge == "both").all(), "edges и transactions не сходятся по парам"
     print("  edges == transactions : OK")
 
     # узлы без единого ребра
@@ -142,10 +228,14 @@ def assign_roles(df: pd.DataFrame) -> pd.DataFrame:
     # A depth-4 zero-out endpoint is not evidence of retained funds.
     consolidator = (
         (f.in_deg >= 2) & (f.out_deg <= 1) &
+        (f.in_kzt > 0) &
         (f.pass_through.fillna(0) <= 0.5) & ~f.truncated_by_depth
     )
     terminal = (f.in_deg > 0) & (f.out_deg == 0) & (f.depth < 4)
-    coordinator = both
+    coordinator = (
+        both & (f.in_deg >= COORDINATOR_MIN_IN_DEG)
+        & (f.out_deg >= COORDINATOR_MIN_OUT_DEG)
+    )
     f["role"] = np.select(
         [distributor, transit, consolidator, terminal, coordinator],
         ["distributor", "transit", "consolidator", "terminal", "coordinator"],
@@ -185,40 +275,48 @@ def assign_roles(df: pd.DataFrame) -> pd.DataFrame:
     scores[peripheral & (f.in_deg == 0) & (f.out_deg > 0)] = 0.24
     f["role_score"] = np.clip(scores, 0.0, 1.0)
 
+    def compact_kzt(value):
+        value = float(value)
+        magnitude = abs(value)
+        for scale, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+            if magnitude >= scale:
+                return f"{value / scale:.1f}{suffix}"
+        return f"{value:.0f}"
+
     def evidence(row):
         pass_text = "undefined" if pd.isna(row.pass_through) else f"{row.pass_through:.2f}"
-        text = (
-            f"{row.role}: in={int(row.in_deg)} counterparties/{int(row.in_tx)} tx/"
-            f"{row.in_kzt:.0f} KZT; out={int(row.out_deg)} counterparties/"
-            f"{int(row.out_tx)} tx/{row.out_kzt:.0f} KZT; pass-through={pass_text}; "
-            f"depth={int(row.depth)}; seed={bool(row.is_seed)}. "
-        )
+        text = (f"{row.role}: {int(row.in_deg)} incoming/{int(row.out_deg)} outgoing; "
+                f"{compact_kzt(row.in_kzt)} in/{compact_kzt(row.out_kzt)} out KZT; "
+                f"pass-through {pass_text}. ")
         if row.role == "distributor":
-            text += f"Outgoing recipients meet the data-based {DISTRIBUTOR_RECIPIENTS}+ threshold."
+            text += f"Fan-out meets the {DISTRIBUTOR_RECIPIENTS}+ recipient rule."
         elif row.role == "transit":
-            text += (f"Non-seed node forwards at least {TRANSIT_PASS_THROUGH:.1f} of observed incoming KZT "
-                     f"and has at least {MIN_INCOMING_KZT} KZT incoming; flow hypothesis only.")
+            text += (f"Non-seed forwards at least {TRANSIT_PASS_THROUGH:.1f} of observed incoming KZT "
+                     f"with {MIN_INCOMING_KZT:,}+ KZT received; transit hypothesis.")
         elif row.role == "consolidator":
-            text += "Multiple observed sources and limited outgoing amount/activity suggest retention or limited redistribution."
+            text += "Multiple sources and limited onward flow suggest collection or retention."
         elif row.role == "terminal":
-            text += "Incoming activity and no outgoing edge at depth below 4 support an observed endpoint hypothesis."
+            text += "No outgoing flow before the depth cutoff; observed endpoint only."
         elif row.role == "coordinator":
-            text += "Both incoming and outgoing edges provide observed connecting activity."
+            text += (f"{COORDINATOR_MIN_IN_DEG}+ incoming and {COORDINATOR_MIN_OUT_DEG}+ outgoing "
+                     "counterparties indicate a multi-party bridge; coordinator hypothesis.")
         elif row.truncated_by_depth:
-            text += "Depth-4 zero-out endpoint may be collection-truncated; terminal or retention behavior is uncertain."
+            text += "Depth-4 endpoint may be cut off; onward activity is unknown."
         elif row.in_deg == 0 and row.out_deg == 0:
-            text += "No observed edges; role evidence is minimal."
+            text += "No observed edges; evidence is limited."
         else:
-            text += "Observed links do not meet a more specific role pattern; evidence is limited."
+            text += "Observed links do not meet another role rule."
         if row.is_seed:
-            text += " Seed incoming coverage may be incomplete; pass-through is not used alone."
+            text += " Seed incoming history may be incomplete."
+        if len(text) > MAX_EVIDENCE_CHARS:
+            text = text[:MAX_EVIDENCE_CHARS - 1].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
         return text
 
     f["evidence"] = f.apply(evidence, axis=1)
     return f
 
-def write_clusters(roles: pd.DataFrame, G: nx.DiGraph, out_dir: Path):
-    """Write community summaries with flow evidence and cautious hypotheses."""
+def build_cluster_summaries(roles: pd.DataFrame, G: nx.DiGraph) -> pd.DataFrame:
+    """Build community summaries with flow evidence and cautious hypotheses."""
     feature_by_gid = roles.set_index("gid")
     cluster_rows = []
     for cluster_id, group in roles.groupby("cluster_id", sort=True):
@@ -265,15 +363,19 @@ def write_clusters(roles: pd.DataFrame, G: nx.DiGraph, out_dir: Path):
             "top_gids": ",".join(map(str, top_gids)),
             "hypothesis": hypothesis,
         })
-    pd.DataFrame(cluster_rows, columns=[
+    return pd.DataFrame(cluster_rows, columns=[
         "cluster_id", "n_nodes", "n_seed", "sum_kzt_internal", "top_gids", "hypothesis",
-    ]).to_csv(out_dir / "clusters.csv", index=False)
+    ])
 
 
-def write_top_nodes(roles: pd.DataFrame, out_dir: Path):
-    """Write the fifty highest-priority nodes and the evidence behind each rank."""
+def write_clusters(roles: pd.DataFrame, G: nx.DiGraph, out_dir: Path):
+    build_cluster_summaries(roles, G).to_csv(out_dir / "clusters.csv", index=False)
+
+
+def build_top_nodes(roles: pd.DataFrame, limit: int = 50) -> pd.DataFrame:
+    """Build a ranked list and the evidence behind each position."""
     ranked = roles.sort_values(["priority_score", "gid"], ascending=[False, True]).copy()
-    top = ranked.head(min(50, len(ranked)))[
+    top = ranked.head(min(limit, len(ranked)))[
         ["gid", "role", "priority_score", "evidence", "pagerank", "cluster_id"]
     ].copy()
     top["why"] = top.apply(
@@ -281,7 +383,11 @@ def write_top_nodes(roles: pd.DataFrame, out_dir: Path):
     )
     top = top[["gid", "role", "priority_score", "why"]]
     top.insert(0, "rank", np.arange(1, len(top) + 1))
-    top.to_csv(out_dir / "top_nodes.csv", index=False)
+    return top
+
+
+def write_top_nodes(roles: pd.DataFrame, out_dir: Path):
+    build_top_nodes(roles).to_csv(out_dir / "top_nodes.csv", index=False)
 
 
 def write_network_html(roles: pd.DataFrame, G: nx.DiGraph, out_dir: Path):
@@ -330,10 +436,8 @@ document.querySelector('#gid-search').addEventListener('input', e => {{ const te
 
 # ---------------------------------------------------------------- выгрузки
 
-def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Assign once; every export derives from the same customer-level rows.
+def prepare_roles(df: pd.DataFrame, G: nx.DiGraph) -> pd.DataFrame:
+    """Assign roles, clusters, and priority scores without writing files."""
     df = assign_roles(df)
     roles = df[["gid", "role", "role_score", "evidence"]].copy()
     # Louvain works on an undirected projection; aggregate reciprocal flows.
@@ -365,11 +469,18 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     # The ratio is undefined without observed incoming KZT; export 0 as a
     # numeric sentinel, with in_deg/in_kzt preserving the reason it is undefined.
     roles["pass_through"] = roles["pass_through"].fillna(0.0)
+    return roles
+
+
+def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    roles = prepare_roles(df, G)
     roles.to_csv(out_dir / "nodes_roles.csv", index=False)
 
     write_clusters(roles, G, out_dir)
     write_top_nodes(roles, out_dir)
     write_network_html(roles, G, out_dir)
+    (out_dir / "analysis_version.txt").write_text(ANALYSIS_VERSION, encoding="utf-8")
     return roles
 
 def summarize_run(G: nx.DiGraph, df: pd.DataFrame):

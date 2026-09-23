@@ -71,7 +71,7 @@ class GraphToolService:
     def from_project_data(cls, data_dir: str | Path = "parquet",
                           output_dir: str | Path | None = None) -> "GraphToolService":
         """Load the graph once and reuse valid exported analytics when available."""
-        from starter import basic_features, build_graph, load, write_outputs
+        from starter import ANALYSIS_VERSION, basic_features, build_graph, load, write_outputs
 
         data_dir = Path(data_dir).resolve()
         output_dir = Path(output_dir).resolve() if output_dir else data_dir.parent / "out"
@@ -79,12 +79,16 @@ class GraphToolService:
         graph = build_graph(edges)
         roles_path = output_dir / "nodes_roles.csv"
         required_columns = {"gid", "role", "cluster_id", "priority_score", "in_deg", "out_deg", "in_kzt", "out_kzt", "pagerank"}
-        required_artifacts = ("nodes_roles.csv", "clusters.csv", "top_nodes.csv", "network.html")
+        required_artifacts = (
+            "nodes_roles.csv", "clusters.csv", "top_nodes.csv", "network.html", "analysis_version.txt",
+        )
         source_mtime = max(path.stat().st_mtime for path in data_dir.glob("*.parquet"))
         artifacts_exist = all((output_dir / name).is_file() for name in required_artifacts)
         artifacts_current = artifacts_exist and all(
             (output_dir / name).stat().st_mtime >= source_mtime for name in required_artifacts
         )
+        version_path = output_dir / "analysis_version.txt"
+        artifacts_current = artifacts_current and version_path.read_text(encoding="utf-8").strip() == ANALYSIS_VERSION
         if roles_path.is_file() and artifacts_current:
             node_data = pd.read_csv(roles_path)
             if not required_columns.issubset(node_data.columns):
@@ -326,17 +330,43 @@ class GraphToolService:
 
     def get_role_explanation(self, gid: Any) -> dict[str, Any]:
         """Return evidence from the exact role conditions in starter.py."""
+        from starter import (
+            COORDINATOR_MIN_IN_DEG, COORDINATOR_MIN_OUT_DEG,
+            DISTRIBUTOR_RECIPIENTS, MIN_INCOMING_KZT, TRANSIT_PASS_THROUGH,
+        )
+
         parsed, found = self._found(gid)
         if not found:
             return {"gid": parsed, "found": False, "error": "gid not found"}
         row = self.nodes_by_gid.loc[parsed]
         role = row["role"]
         rules = {
-            "terminal": [("out_degree", row["out_deg"], "= 0"), ("truncated_by_depth", row.get("truncated_by_depth", False), "= false")],
-            "distributor": [("in_degree", row["in_deg"], "= 0"), ("out_degree", row["out_deg"], "> 0")],
-            "coordinator": [("in_degree", row["in_deg"], ">= 2"), ("out_degree", row["out_deg"], ">= 2")],
-            "transit": [("in_degree", row["in_deg"], "> 0"), ("out_degree", row["out_deg"], "> 0"), ("pass_through", row.get("pass_through"), ">= 0.8")],
-            "consolidator": [("in_degree", row["in_deg"], "> 0"), ("out_degree", row["out_deg"], "> 0")],
+            "distributor": [
+                ("out_degree", row["out_deg"], f">= {DISTRIBUTOR_RECIPIENTS} recipients"),
+            ],
+            "transit": [
+                ("is_seed", row.get("is_seed", False), "= false"),
+                ("in_degree", row["in_deg"], "> 0"),
+                ("out_degree", row["out_deg"], "> 0"),
+                ("incoming_kzt", row["in_kzt"], f">= {MIN_INCOMING_KZT}"),
+                ("pass_through", row.get("pass_through"), f">= {TRANSIT_PASS_THROUGH}"),
+            ],
+            "consolidator": [
+                ("in_degree", row["in_deg"], ">= 2"),
+                ("out_degree", row["out_deg"], "<= 1"),
+                ("incoming_kzt", row["in_kzt"], "> 0"),
+                ("pass_through", row.get("pass_through"), "<= 0.5"),
+                ("truncated_by_depth", row.get("truncated_by_depth", False), "= false"),
+            ],
+            "terminal": [
+                ("in_degree", row["in_deg"], "> 0"),
+                ("out_degree", row["out_deg"], "= 0"),
+                ("depth", row.get("depth"), "< 4"),
+            ],
+            "coordinator": [
+                ("in_degree", row["in_deg"], f">= {COORDINATOR_MIN_IN_DEG}"),
+                ("out_degree", row["out_deg"], f">= {COORDINATOR_MIN_OUT_DEG}"),
+            ],
             "peripheral": [("role_rule", "no earlier rule matched", "peripheral")],
         }
         return _json_safe({"gid": parsed, "found": True, "role": role,
