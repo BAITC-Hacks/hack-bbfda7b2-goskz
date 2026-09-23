@@ -107,16 +107,74 @@ def basic_features(G: nx.DiGraph, nodes: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- выгрузки
 
-def write_outputs(df: pd.DataFrame, out_dir: Path):
+def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. nodes_roles.csv — схема из ТЗ, роли не заполнены
     roles = df[["gid"]].copy()
-    roles["role"] = ""            # TODO: одна из ROLES
-    roles["role_score"] = 0.0     # TODO: 0..1
-    roles["cluster_id"] = -1      # TODO: номер кластера
-    roles["priority_score"] = 0.0 # TODO: 0..1
-    roles["evidence"] = ""        # TODO: почему — с числами, до 200 символов
+    roles["role"] = np.select(
+        [
+            (df.out_deg == 0) & ~df.truncated_by_depth,
+            (df.in_deg == 0) & (df.out_deg > 0),
+            (df.in_deg >= 2) & (df.out_deg >= 2),
+            (df.in_deg > 0) & (df.out_deg > 0) & (df.pass_through >= 0.8),
+            (df.in_deg > 0) & (df.out_deg > 0),
+        ],
+        ["terminal", "distributor", "coordinator", "transit", "consolidator"],
+        default="peripheral",
+    )
+    roles["role_score"] = np.select(
+        [
+            (df.out_deg == 0) & ~df.truncated_by_depth,
+            (df.in_deg == 0) & (df.out_deg > 0),
+            (df.in_deg >= 2) & (df.out_deg >= 2),
+            (df.in_deg > 0) & (df.out_deg > 0) & (df.pass_through >= 0.8),
+            (df.in_deg > 0) & (df.out_deg > 0),
+        ],
+        [1.0, 1.0, 1.0, np.clip(df.pass_through, 0.0, 1.0), 1.0],
+        default=0.0,
+    )
+    # Louvain works on an undirected projection; aggregate reciprocal flows.
+    UG = nx.Graph()
+    UG.add_nodes_from(G)
+    for src, dst, data in G.edges(data=True):
+        weight = data["sum_kzt"]
+        if UG.has_edge(src, dst):
+            UG[src][dst]["weight"] += weight
+        else:
+            UG.add_edge(src, dst, weight=weight)
+    communities = nx.community.louvain_communities(UG, weight="weight", seed=42)
+    cluster_by_gid = {
+        gid: cluster_id
+        for cluster_id, community in enumerate(communities)
+        for gid in community
+    }
+    roles["cluster_id"] = roles["gid"].map(cluster_by_gid).fillna(-1).astype(int)
+    total_kzt = df["in_kzt"] + df["out_kzt"]
+    log_volume = np.log1p(total_kzt)
+    volume_score = log_volume / log_volume.max() if log_volume.max() > 0 else log_volume
+    pagerank_score = df["pagerank"] / df["pagerank"].max() if df["pagerank"].max() > 0 else df["pagerank"]
+    roles["priority_score"] = (0.5 * roles["role_score"] + 0.3 * volume_score + 0.2 * pagerank_score).clip(0.0, 1.0)
+    reason = np.select(
+        [
+            roles["role"].eq("terminal"),
+            roles["role"].eq("distributor"),
+            roles["role"].eq("coordinator"),
+            roles["role"].eq("transit"),
+            roles["role"].eq("consolidator"),
+        ],
+        ["outgoing=0", "incoming=0", "in>=2,out>=2",
+         "pass_through>=0.80", "has incoming and outgoing"],
+        default="insufficient links",
+    )
+    roles["evidence"] = (
+        pd.Series(reason, index=roles.index)
+        + "; in=" + df["in_deg"].astype(str)
+        + ", out=" + df["out_deg"].astype(str)
+        + "; KZT in=" + df["in_kzt"].round().astype("int64").astype(str)
+        + ", out=" + df["out_kzt"].round().astype("int64").astype(str)
+        + "; pass=" + df["pass_through"].fillna(0).round(2).astype(str)
+    ).str.slice(0, 200)
     roles = roles.merge(
         df[["gid", "in_deg", "out_deg", "in_kzt", "out_kzt", "pagerank",
             "pass_through", "depth", "is_seed", "truncated_by_depth"]],
@@ -169,7 +227,7 @@ def main():
     sanity_check(edges, nodes, tx)
     G = build_graph(edges)
     df = basic_features(G, nodes)
-    write_outputs(df, Path(a.out))
+    write_outputs(df, Path(a.out), G)
     hints(G, df)
 
 
