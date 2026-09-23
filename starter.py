@@ -5,17 +5,12 @@
 Что он делает:
   1. грузит три parquet-файла и проверяет их консистентность;
   2. собирает направленный взвешенный граф;
-  3. считает БАЗОВЫЕ метрики узлов (степени, обороты, PageRank);
-  4. пишет три выгрузки в требуемой ТЗ схеме — с ПУСТЫМИ ролями.
-
-Чего он НЕ делает — это ваша работа:
-  * не присваивает роли,
-  * не кластеризует,
-  * не ранжирует узлы,
-  * не рисует граф.
+  3. считает метрики узлов и назначает объяснимые поведенческие роли;
+  4. строит сообщества и приоритетный список;
+  5. пишет три выгрузки в схеме из ТЗ.
 
 Запуск:
-    python starter.py --data ../data --out ./out
+    python starter.py --data ./parquet --out ./out
 """
 
 import argparse
@@ -26,6 +21,13 @@ import pandas as pd
 import networkx as nx
 
 ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "peripheral"]
+
+# Distribution-informed cutoffs for this supplied graph. out_deg p95 = 5;
+# incoming amount median = 50,000 KZT. A pass-through of .8 is above the
+# 80th percentile among customers with observed incoming funds.
+DISTRIBUTOR_RECIPIENTS = 5
+MIN_INCOMING_KZT = 50_000
+TRANSIT_PASS_THROUGH = 0.8
 
 
 # ---------------------------------------------------------------- загрузка
@@ -123,35 +125,102 @@ def basic_features(G: nx.DiGraph, nodes: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def assign_roles(df: pd.DataFrame) -> pd.DataFrame:
+    """Assign one evidence-based role and a heuristic support score per customer."""
+    f = df.copy()
+    both = (f.in_deg > 0) & (f.out_deg > 0)
+    distributor = f.out_deg >= DISTRIBUTOR_RECIPIENTS
+    transit = (
+        both & ~f.is_seed.astype(bool) & (f.in_kzt >= MIN_INCOMING_KZT)
+        & (f.pass_through >= TRANSIT_PASS_THROUGH)
+    )
+    # A depth-4 zero-out endpoint is not evidence of retained funds.
+    consolidator = (
+        (f.in_deg >= 2) & (f.out_deg <= 1) &
+        (f.pass_through.fillna(0) <= 0.5) & ~f.truncated_by_depth
+    )
+    terminal = (f.in_deg > 0) & (f.out_deg == 0) & (f.depth < 4)
+    coordinator = both
+    f["role"] = np.select(
+        [distributor, transit, consolidator, terminal, coordinator],
+        ["distributor", "transit", "consolidator", "terminal", "coordinator"],
+        default="peripheral",
+    )
+
+    # Heuristic strength (0..1), not calibrated probabilities.
+    scores = np.full(len(f), 0.28, dtype=float)
+    scores[distributor] = np.minimum(
+        0.96, 0.62 + 0.025 * (f.loc[distributor, "out_deg"] - DISTRIBUTOR_RECIPIENTS)
+        + 0.06 * (f.loc[distributor, "out_tx"] >= f.loc[distributor, "out_deg"] * 2)
+    )
+    scores[transit] = np.minimum(
+        0.90, 0.58 + 0.12 * np.minimum(f.loc[transit, "pass_through"], 2.0) / 2.0
+        + 0.08 * (f.loc[transit, "in_kzt"] >= 2 * MIN_INCOMING_KZT)
+        + 0.08 * (f.loc[transit, "in_deg"] + f.loc[transit, "out_deg"] >= 3)
+    )
+    scores[consolidator] = np.minimum(
+        0.88, 0.56 + 0.08 * np.minimum(f.loc[consolidator, "in_deg"] - 2, 4) / 4
+        + 0.10 * (f.loc[consolidator, "out_deg"] == 0)
+        + 0.10 * (f.loc[consolidator, "in_tx"] >= f.loc[consolidator, "in_deg"] * 2)
+    )
+    scores[terminal] = np.minimum(
+        0.82, 0.54 + 0.08 * (f.loc[terminal, "in_deg"] >= 2)
+        + 0.08 * (f.loc[terminal, "in_tx"] >= 3)
+        + 0.06 * (f.loc[terminal, "depth"] < 3)
+    )
+    scores[coordinator] = np.minimum(
+        0.78, 0.46 + 0.08 * ((f.loc[coordinator, "in_deg"] >= 2)
+                              & (f.loc[coordinator, "out_deg"] >= 2))
+        + 0.08 * (f.loc[coordinator, "in_deg"] + f.loc[coordinator, "out_deg"] >= 3)
+        + 0.08 * (f.loc[coordinator, "in_tx"] + f.loc[coordinator, "out_tx"] >= 3)
+    )
+    peripheral = f.role.eq("peripheral")
+    scores[peripheral & f.truncated_by_depth] = 0.18
+    scores[peripheral & (f.in_deg == 0) & (f.out_deg == 0)] = 0.12
+    scores[peripheral & (f.in_deg == 0) & (f.out_deg > 0)] = 0.24
+    f["role_score"] = np.clip(scores, 0.0, 1.0)
+
+    def evidence(row):
+        pass_text = "undefined" if pd.isna(row.pass_through) else f"{row.pass_through:.2f}"
+        text = (
+            f"{row.role}: in={int(row.in_deg)} counterparties/{int(row.in_tx)} tx/"
+            f"{row.in_kzt:.0f} KZT; out={int(row.out_deg)} counterparties/"
+            f"{int(row.out_tx)} tx/{row.out_kzt:.0f} KZT; pass-through={pass_text}; "
+            f"depth={int(row.depth)}; seed={bool(row.is_seed)}. "
+        )
+        if row.role == "distributor":
+            text += f"Outgoing recipients meet the data-based {DISTRIBUTOR_RECIPIENTS}+ threshold."
+        elif row.role == "transit":
+            text += (f"Non-seed node forwards at least {TRANSIT_PASS_THROUGH:.1f} of observed incoming KZT "
+                     f"and has at least {MIN_INCOMING_KZT} KZT incoming; flow hypothesis only.")
+        elif row.role == "consolidator":
+            text += "Multiple observed sources and limited outgoing amount/activity suggest retention or limited redistribution."
+        elif row.role == "terminal":
+            text += "Incoming activity and no outgoing edge at depth below 4 support an observed endpoint hypothesis."
+        elif row.role == "coordinator":
+            text += "Both incoming and outgoing edges provide observed connecting activity."
+        elif row.truncated_by_depth:
+            text += "Depth-4 zero-out endpoint may be collection-truncated; terminal or retention behavior is uncertain."
+        elif row.in_deg == 0 and row.out_deg == 0:
+            text += "No observed edges; role evidence is minimal."
+        else:
+            text += "Observed links do not meet a more specific role pattern; evidence is limited."
+        if row.is_seed:
+            text += " Seed incoming coverage may be incomplete; pass-through is not used alone."
+        return text
+
+    f["evidence"] = f.apply(evidence, axis=1)
+    return f
+
+
 # ---------------------------------------------------------------- выгрузки
 
 def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. nodes_roles.csv — схема из ТЗ, роли не заполнены
-    roles = df[["gid"]].copy()
-    roles["role"] = np.select(
-        [
-            (df.out_deg == 0) & ~df.truncated_by_depth,
-            (df.in_deg == 0) & (df.out_deg > 0),
-            (df.in_deg >= 2) & (df.out_deg >= 2),
-            (df.in_deg > 0) & (df.out_deg > 0) & (df.pass_through >= 0.8),
-            (df.in_deg > 0) & (df.out_deg > 0),
-        ],
-        ["terminal", "distributor", "coordinator", "transit", "consolidator"],
-        default="peripheral",
-    )
-    roles["role_score"] = np.select(
-        [
-            (df.out_deg == 0) & ~df.truncated_by_depth,
-            (df.in_deg == 0) & (df.out_deg > 0),
-            (df.in_deg >= 2) & (df.out_deg >= 2),
-            (df.in_deg > 0) & (df.out_deg > 0) & (df.pass_through >= 0.8),
-            (df.in_deg > 0) & (df.out_deg > 0),
-        ],
-        [1.0, 1.0, 1.0, np.clip(df.pass_through, 0.0, 1.0), 1.0],
-        default=0.0,
-    )
+    # 1. Assign once; every export derives from the same customer-level rows.
+    df = assign_roles(df)
+    roles = df[["gid", "role", "role_score", "evidence"]].copy()
     # Louvain works on an undirected projection; aggregate reciprocal flows.
     # Include isolated input customers so none are assigned cluster_id=-1.
     UG = nx.Graph()
@@ -174,26 +243,6 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     volume_score = log_volume / log_volume.max() if log_volume.max() > 0 else log_volume
     pagerank_score = df["pagerank"] / df["pagerank"].max() if df["pagerank"].max() > 0 else df["pagerank"]
     roles["priority_score"] = (0.5 * roles["role_score"] + 0.3 * volume_score + 0.2 * pagerank_score).clip(0.0, 1.0)
-    reason = np.select(
-        [
-            roles["role"].eq("terminal"),
-            roles["role"].eq("distributor"),
-            roles["role"].eq("coordinator"),
-            roles["role"].eq("transit"),
-            roles["role"].eq("consolidator"),
-        ],
-        ["outgoing=0", "incoming=0", "in>=2,out>=2",
-         "pass_through>=0.80", "has incoming and outgoing"],
-        default="insufficient links",
-    )
-    roles["evidence"] = (
-        pd.Series(reason, index=roles.index)
-        + "; in=" + df["in_deg"].astype(str)
-        + ", out=" + df["out_deg"].astype(str)
-        + "; KZT in=" + df["in_kzt"].round().astype("int64").astype(str)
-        + ", out=" + df["out_kzt"].round().astype("int64").astype(str)
-        + "; pass=" + df["pass_through"].fillna(0).round(2).astype(str)
-    ).str.slice(0, 200)
     roles = roles.merge(
         df[["gid", "in_deg", "out_deg", "in_kzt", "out_kzt", "pagerank",
             "pass_through", "depth", "is_seed", "truncated_by_depth"]],
@@ -240,6 +289,9 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
             hypothesis += f" {truncated} member(s) are depth-4 endpoints, so onward flows may be unobserved."
         if n_seed:
             hypothesis += f" Includes {n_seed} seed customer(s), whose incoming flows may be incomplete."
+        role_mix = member_features["role"].value_counts()
+        mix_text = ", ".join(f"{role}={count}" for role, count in role_mix.items())
+        hypothesis += f" Assigned role mix: {mix_text}."
         cluster_rows.append({
             "cluster_id": cluster_id,
             "n_nodes": n_nodes,
@@ -259,15 +311,7 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     why = []
     for row in ranked.itertuples(index=False):
         f = ranked_features.loc[row.gid]
-        pass_ratio = "n/a" if pd.isna(f.pass_through) else f"{f.pass_through:.2f}"
-        explanation = (f"{row.role}; incoming {int(f.in_deg)} counterparties/{f.in_kzt:,.0f} KZT, "
-                       f"outgoing {int(f.out_deg)} counterparties/{f.out_kzt:,.0f} KZT; "
-                       f"pass-through {pass_ratio}; PageRank {f.pagerank:.5g}; cluster {row.cluster_id}.")
-        if bool(f.is_seed):
-            explanation += " Seed incoming-flow coverage may be incomplete."
-        if bool(f.truncated_by_depth):
-            explanation += " Depth-4 endpoint may have unobserved onward transfers."
-        why.append(explanation)
+        why.append(f"{row.evidence} PageRank={f.pagerank:.5g}; cluster={row.cluster_id}.")
     ranked["why"] = why
     top_nodes = ranked.head(min(50, len(ranked)))[["gid", "role", "priority_score", "why"]].copy()
     top_nodes.insert(0, "rank", np.arange(1, len(top_nodes) + 1))
@@ -276,28 +320,21 @@ def write_outputs(df: pd.DataFrame, out_dir: Path, G: nx.DiGraph):
     print(f"Выгрузки записаны в {out_dir}/")
 
 
-# ---------------------------------------------------------------- подсказки
+# ---------------------------------------------------------------- сводка
 
-def hints(G: nx.DiGraph, df: pd.DataFrame):
-    """Куда смотреть дальше. Ответов здесь нет — только направления."""
-    print("\nС ЧЕГО НАЧАТЬ")
+def summarize_run(G: nx.DiGraph, df: pd.DataFrame):
+    """Print role totals and the main limits of the observed graph."""
+    assigned = assign_roles(df)
+    print("\nСВОДКА НАЗНАЧЕННЫХ РОЛЕЙ")
     print("-" * 64)
-    print(f"  узлов, получающих от 3+ разных плательщиков : {(df.in_deg >= 3).sum()}")
-    print(f"  узлов, рассылающих на 10+ получателей       : {(df.out_deg >= 10).sum()}")
-    print(f"  узлов и с входом, и с выходом               : {((df.in_deg > 0) & (df.out_deg > 0)).sum()}")
-    print(f"  узлов, обрезанных 4-м коленом               : {df.truncated_by_depth.sum()}  <- разберитесь")
-    print(f"  слабосвязных компонент                      : {nx.number_weakly_connected_components(G)}")
-    print("""
-  Вопросы, на которые стоит ответить метриками:
-    * чем «деньги пришли и остались» отличается от «пришли и ушли дальше»?
-    * что важнее для роли — количество плательщиков или сумма?
-    * узел собирает средства от нескольких SEED — это случайность или структура?
-    * если убрать узел, сеть распадётся или переживёт?
-
-  Полезное в networkx: pagerank, hits, betweenness_centrality,
-  community.louvain_communities, simple_cycles, all_simple_paths.
-  Не забудьте: граф НАПРАВЛЕННЫЙ и ВЗВЕШЕННЫЙ.
-""")
+    for role in ROLES:
+        print(f"  {role:<14}: {(assigned.role == role).sum():>5}")
+    print(f"  узлов с обеими сторонами связей : {((df.in_deg > 0) & (df.out_deg > 0)).sum()}")
+    print(f"  depth-4 узлов без исходящих      : {int(df.truncated_by_depth.sum())}")
+    print(f"  seed-клиентов                    : {int(df.is_seed.sum())}")
+    print(f"  слабосвязных компонент           : {nx.number_weakly_connected_components(G)}")
+    print("  У seed-клиентов входящие потоки могут быть неполными; узлы depth 4 могут быть обрезаны сбором.")
+    print("  Роли — гипотезы по наблюдаемым потокам, а не утверждения о нарушениях.")
 
 
 def main():
@@ -314,7 +351,7 @@ def main():
     G = build_graph(edges)
     df = basic_features(G, nodes)
     write_outputs(df, out_dir, G)
-    hints(G, df)
+    summarize_run(G, df)
 
 
 if __name__ == "__main__":
