@@ -31,6 +31,7 @@ ROLES = ["consolidator", "transit", "distributor", "terminal", "coordinator", "p
 # ---------------------------------------------------------------- загрузка
 
 def load(data_dir: Path):
+    data_dir=Path("parquet")
     edges = pd.read_parquet(data_dir / "edges.parquet")
     nodes = pd.read_parquet(data_dir / "nodes.parquet")
     tx = pd.read_parquet(data_dir / "transactions.parquet")
