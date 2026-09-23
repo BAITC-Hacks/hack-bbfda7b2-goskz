@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import math
 import colorsys
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import networkx as nx
 import pandas as pd
@@ -14,7 +19,6 @@ import streamlit as st
 from agent_tools import GraphToolService
 from aml_agent import AMLAnalystAgent
 
-ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "parquet"
 OUT_DIR = ROOT / "out"
 ROLE_COLORS = {
@@ -436,55 +440,56 @@ def main() -> None:
             if chosen != selected_gid: select_gid(chosen)
         render_inspector(str(st.session_state.get("selected_gid", "")), nodes, edges, annotations, "inspector")
         st.caption("Observed values describe the supplied extract. Seed incompleteness and depth-cutoff truncation limit interpretation.")
-    st.divider()
-    st.markdown("## Analyst Assistant")
-    st.caption("Ask questions about the observed network. Answers use deterministic graph analysis tools.")
-    try:
-        analyst_agent = get_analyst_agent()
-        assistant_available = True
-    except RuntimeError as exc:
-        assistant_available = False
-        st.info(f"AI analyst is unavailable: {exc}")
-
-    if "chat_messages" not in st.session_state:
-        st.session_state["chat_messages"] = []
-    for message in st.session_state["chat_messages"]:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-            if message.get("tool_calls"):
-                with st.expander("How this answer was generated"):
-                    st.json(message["tool_calls"])
-
-    question = st.chat_input(
-        "Ask about roles, flows, clusters, or a GID...",
-        disabled=not assistant_available,
-    )
-    if question:
-        history = st.session_state["chat_messages"][-12:]
-        st.session_state["chat_messages"].append({"role": "user", "content": question})
+    with st.sidebar:
+        st.divider()
+        st.markdown("### Analyst Assistant")
+        st.caption("Ask about observed flows, roles, clusters, or a GID.")
         try:
-            response = analyst_agent.ask(question, history)
-        except Exception as exc:
-            st.session_state["chat_messages"].append({
-                "role": "assistant",
-                "content": f"I could not complete the analysis request: {exc}",
-                "tool_calls": [],
-            })
-        else:
-            st.session_state["chat_messages"].append({
-                "role": "assistant",
-                "content": response.answer,
-                "tool_calls": response.tool_calls,
-            })
-            if response.visualization:
-                focus = response.visualization.get("focus_node")
-                if focus is not None and str(focus) in set(nodes.gid.astype(str)):
-                    st.session_state["selected_gid"] = str(focus)
-                    st.session_state["agent_highlight_nodes"] = [
-                        str(gid) for gid in response.visualization.get("highlight_nodes", [])
-                    ]
-                    st.session_state["agent_highlight_edges"] = response.visualization.get("highlight_edges", [])
-        st.rerun()
+            analyst_agent = get_analyst_agent()
+            assistant_available = True
+        except RuntimeError as exc:
+            assistant_available = False
+            st.info(f"AI analyst is unavailable: {exc}")
+
+        if "chat_messages" not in st.session_state:
+            st.session_state["chat_messages"] = []
+        for message in st.session_state["chat_messages"]:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+                if message.get("tool_calls"):
+                    with st.expander("How this answer was generated"):
+                        st.json(message["tool_calls"])
+
+        question = st.chat_input(
+            "Ask about the network...",
+            disabled=not assistant_available,
+        )
+        if question:
+            history = st.session_state["chat_messages"][-12:]
+            st.session_state["chat_messages"].append({"role": "user", "content": question})
+            try:
+                response = analyst_agent.ask(question, history)
+            except Exception as exc:
+                st.session_state["chat_messages"].append({
+                    "role": "assistant",
+                    "content": f"I could not complete the analysis request: {exc}",
+                    "tool_calls": [],
+                })
+            else:
+                st.session_state["chat_messages"].append({
+                    "role": "assistant",
+                    "content": response.answer,
+                    "tool_calls": response.tool_calls,
+                })
+                if response.visualization:
+                    focus = response.visualization.get("focus_node")
+                    if focus is not None and str(focus) in set(nodes.gid.astype(str)):
+                        st.session_state["selected_gid"] = str(focus)
+                        st.session_state["agent_highlight_nodes"] = [
+                            str(gid) for gid in response.visualization.get("highlight_nodes", [])
+                        ]
+                        st.session_state["agent_highlight_edges"] = response.visualization.get("highlight_edges", [])
+            st.rerun()
 
 
 if __name__ == "__main__":

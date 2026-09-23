@@ -12,7 +12,9 @@ class StarterTests(unittest.TestCase):
     def test_validate_startup_accepts_complete_project_layout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "app.py").touch()
+            interface_dir = root / "interface"
+            interface_dir.mkdir()
+            (interface_dir / "network_app.py").touch()
             data_dir = root / "parquet"
             data_dir.mkdir()
             for name in ("edges.parquet", "nodes.parquet", "transactions.parquet"):
@@ -26,7 +28,7 @@ class StarterTests(unittest.TestCase):
             with patch("starter.subprocess.run") as run:
                 starter.launch_streamlit(root)
             run.assert_called_once_with(
-                [sys.executable, "-m", "streamlit", "run", str(root / "app.py")],
+                [sys.executable, "-m", "streamlit", "run", str(root / "interface" / "network_app.py")],
                 check=True,
                 cwd=str(root),
             )

@@ -27,10 +27,10 @@ $env:AML_AGENT_MODEL = "gpt-4.1-mini"  # optional
 python starter.py
 ```
 
-`starter.py` validates the project paths and launches `app.py` through the same
-Python interpreter. `app.py` delegates to `interface/network_app.py`, which
-renders the network dashboard and embeds the analyst chat below it. The UI and
-agent share one cached `GraphToolService`; chat history and visualization
+`starter.py` validates the project paths and launches
+`interface/network_app.py` directly through the same Python interpreter. The
+network app renders the dashboard and embeds the analyst chat below it. The UI
+and agent share one cached `GraphToolService`; chat history and visualization
 highlights persist in `st.session_state`. Agent-selected nodes and directed
 flows are highlighted in the Plotly graph, and the focus gid becomes the
 dashboard selection. Deterministic tool-call results remain visible in the chat.

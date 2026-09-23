@@ -409,7 +409,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 def validate_startup(root: Path = PROJECT_ROOT) -> None:
     """Check the unified UI, transaction inputs, and its runtime dependencies."""
-    app_path, data_dir = root / "app.py", root / "parquet"
+    app_path, data_dir = root / "interface" / "network_app.py", root / "parquet"
     required_data = ("edges.parquet", "nodes.parquet", "transactions.parquet")
     missing = [str(data_dir / name) for name in required_data if not (data_dir / name).is_file()]
     if not app_path.is_file():
@@ -423,9 +423,9 @@ def validate_startup(root: Path = PROJECT_ROOT) -> None:
 
 
 def launch_streamlit(root: Path = PROJECT_ROOT) -> None:
-    """Run the unified Streamlit app using the current Python environment."""
+    """Run the network workspace directly using the current Python environment."""
     subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", str(root / "app.py")],
+        [sys.executable, "-m", "streamlit", "run", str(root / "interface" / "network_app.py")],
         cwd=str(root),
         check=True,
     )
